@@ -24,6 +24,7 @@ pub const FullRange = TensorRange{ null, null, null };
 pub const TensorIdx = union(enum) {
     idx: i32,
     range: TensorRange,
+    //TODO add slice
 };
 
 fn Tensor(comptime T: type) type {
@@ -34,6 +35,7 @@ fn Tensor(comptime T: type) type {
         rank: i32,
         // size: i32,
         alloc: std.mem.Allocator,
+        offsets: []usize,
         grad: ?*Self,
 
         fn init(alloc: Allocator, shape: []const i32) !Tensor(T) {
@@ -52,7 +54,16 @@ fn Tensor(comptime T: type) type {
             for (shape) |el| {
                 data_size *= el;
             }
-            return Tensor(T){ .data = try alloc.alloc(T, @intCast(data_size)), .shape = try alloc.dupe(i32, shape), .rank = @intCast(shape.len), .alloc = alloc, .grad = null };
+            const offsets = try alloc.alloc(usize, shape.len);
+            for (0..shape.len) |i| {
+                const idx = shape.len - 1 - i;
+                switch (i) {
+                    0 => offsets[idx] = 0,
+                    1 => offsets[idx] = @intCast(shape[idx + 1]),
+                    else => offsets[idx] = offsets[idx + 1] * @as(usize, @intCast(shape[idx + 1])),
+                }
+            }
+            return Tensor(T){ .data = try alloc.alloc(T, @intCast(data_size)), .shape = try alloc.dupe(i32, shape), .rank = @intCast(shape.len), .alloc = alloc, .grad = null, .offsets = offsets };
         }
 
         pub fn clone(self: *const Self, alloc: std.mem.Allocator) !Tensor(T) {
@@ -132,6 +143,18 @@ fn Tensor(comptime T: type) type {
             return TensorError.Dummy;
         }
 
+        //computes the index in .data
+        inline fn getIndex(self: *const Self, idxs: []const usize) usize {
+            std.debug.assert(self.shape.len > 0);
+            std.debug.assert(self.offsets.len == idxs.len);
+            std.debug.assert(self.offsets[self.offsets.len - 1] == 0);
+            var sum: usize = idxs[idxs.len - 1];
+            for (0..self.offsets.len - 1) |i| {
+                sum += self.offsets[i] * idxs[i];
+            }
+            return sum;
+        }
+
         // pub fn reshape(self: *const Self, shape: []i32) !Tensor {
         //     return TensorError.Dummy;
         // }
@@ -152,6 +175,7 @@ fn Tensor(comptime T: type) type {
         pub fn deinit(self: *const Self) void {
             self.alloc.free(self.data);
             self.alloc.free(self.shape);
+            self.alloc.free(self.offsets);
             if (self.grad) |grad| self.alloc.destroy(grad);
         }
     };
@@ -204,11 +228,14 @@ inline fn getSizeFromShape(shape: []const i32) i32 {
 //caller must free string
 inline fn tensorIdxToString(alloc: Allocator, idxs: []const TensorIdx, markAt: ?usize) ![]u8 {
     const substrings = try alloc.alloc([]u8, idxs.len);
+
+    var i: usize = 0;
     defer {
-        for (substrings) |ss| alloc.free(ss);
+        //free exact numbers of allocations
+        for (0..i) |j| alloc.free(substrings[j]);
         alloc.free(substrings);
     }
-    for (0..idxs.len) |i| {
+    while (i < idxs.len) : (i += 1) {
         const field = idxs[i];
         switch (field) {
             .idx => |idx| {
@@ -231,6 +258,7 @@ inline fn tensorIdxToString(alloc: Allocator, idxs: []const TensorIdx, markAt: ?
             },
         }
     }
+
     const idx_string = try std.mem.join(alloc, ", ", substrings);
     defer alloc.free(idx_string);
 
@@ -406,4 +434,15 @@ test "get sub tensor wrong indices" {
     try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 4 }, .{ .range = .{ 1, null, null } } }));
     try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ 3, null, null } } }));
     try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ null, 3, null } } }));
+}
+
+test "getIndex" {
+    const alloc = testing.allocator;
+    // var tensor = try fromSlice(f32, alloc, &[_]f32{ 1, 2, 3, 4, 5, 6 }, &[_]i32{ 2, 3 });
+    var tensor = try zeros(i64, alloc, &[_]i32{ 4, 3, 2 });
+    defer tensor.deinit();
+
+    const idxs = [_]usize{ 1, 2, 1 };
+    try testing.expectEqualSlices(usize, &[_]usize{ 6, 2, 0 }, tensor.offsets);
+    try testing.expectEqual(11, tensor.getIndex(&idxs));
 }

@@ -19,12 +19,22 @@ const TensorError = error{
 //{x,y,z} -> [x:y:z]
 //{null, null, x} -> [::z]
 pub const TensorRange = [3]?i32;
+inline fn getTensorRangeLen(range: *const TensorRange, default_len: i32) i32 {
+    return @divFloor((range[1] orelse default_len) - (range[0] orelse 0), range[2] orelse 1);
+}
 pub const FullRange = TensorRange{ null, null, null };
 
 pub const TensorIdx = union(enum) {
     idx: i32,
     range: TensorRange,
     //TODO add slice
+
+    inline fn getLen(self: TensorIdx, len: i32) i32 {
+        switch (self) {
+            .idx => return 1,
+            .range => |range| return getTensorRangeLen(&range, len),
+        }
+    }
 };
 
 fn Tensor(comptime T: type) type {
@@ -49,7 +59,12 @@ fn Tensor(comptime T: type) type {
                 },
             }
 
-            if (shapeIsValidForTensor(shape) == false) return TensorError.InvalidShape;
+            if (shapeIsValidForTensor(shape) == false) {
+                const shape_string = try sliceToString(i32, alloc, shape);
+                defer alloc.free(shape_string);
+                std.debug.print("Tensor shape {s}", .{shape_string});
+                return TensorError.InvalidShape;
+            }
             var data_size: i32 = 1;
             for (shape) |el| {
                 data_size *= el;
@@ -120,39 +135,123 @@ fn Tensor(comptime T: type) type {
         //- anon structs / tuples are required to be comp time known
         //- index {1, -1, 2} and separate range {":", ".", ":"} parameter => harder to use
         //- slice of unions {.{.i=0}, .{i=1}, .{range=[3]int{}}}
-        pub fn get(self: *const Self, idxs: []const TensorIdx) !Tensor(T) {
+        pub fn get(self: *const Self, idxs: []const TensorIdx, alloc: std.mem.Allocator) !Tensor(T) {
             if (try tensorIdxIsValid(self.alloc, self.shape, idxs) == false) return TensorError.InvalidIndex;
-            for (0..idxs.len) |i| {
-                const d = idxs.len - 1 - i;
-                const field = idxs[d];
-                switch (field) {
-                    .idx => |idx| {
-                        // std.debug.print("{d}\n", .{idx});
-                        _ = idx;
+
+            //compute new shape of tensor
+            const new_shape: []i32 = try alloc.dupe(i32, self.shape);
+            defer alloc.free(new_shape);
+            for (idxs, 0..) |idx, i| {
+                new_shape[i] = idx.getLen(self.shape[i]);
+            }
+
+            var new_tensor = try Tensor(T).init(alloc, new_shape);
+            errdefer new_tensor.deinit();
+
+            //expand idxs
+            const exp_idxs = try alloc.alloc(TensorIdx, new_tensor.shape.len);
+            defer alloc.free(exp_idxs);
+            @memcpy(exp_idxs[0..idxs.len], idxs);
+            if (exp_idxs.len > idxs.len) @memset(exp_idxs[idxs.len..], TensorIdx{ .range = .{ null, null, null } });
+
+            var data_idxs = try std.ArrayList(usize).initCapacity(alloc, new_tensor.shape.len);
+            defer data_idxs.deinit();
+            const copied = try self.sliceRec(&new_tensor, exp_idxs, 0, &data_idxs, 0);
+            std.debug.assert(copied > 0);
+
+            // for (0..idxs.len) |i| {
+            //     const d = idxs.len - 1 - i;
+            //     const field = idxs[d];
+            //     switch (field) {
+            //         .idx => |idx| {
+            //             // std.debug.print("{d}\n", .{idx});
+            //             _ = idx;
+            //         },
+            //         .range => |range| {
+            //             _ = range;
+            //             // for (range) |j| {
+            //             //     std.debug.print("{?} ", .{j});
+            //             // }
+            //             // std.debug.print("\n", .{});
+            //         },
+            //     }
+            // }
+
+            //TODO deduce which dimensions to remove
+
+            return new_tensor;
+        }
+
+        fn sliceRec(self: *const Self, to: *Self, idxs: []const TensorIdx, idx_pos: usize, data_idxs: *std.ArrayList(usize), to_offset: usize) !usize {
+            //idx_pos describes the position sliced idxs: idxs[idx_pos:]
+            //if(idxs describes successive memory)
+            std.debug.assert(idxs.len == self.shape.len); //idxs must be expanded
+            //TODO assert all elements are ranges of lists
+            const new_idxs = idxs[idx_pos..];
+            var ok = true;
+            for (new_idxs, 0..) |idx, i| {
+                switch (idx) {
+                    .idx => |id| {
+                        if (!(self.shape[i] == 1 and id == 0)) ok = false;
                     },
-                    .range => |range| {
-                        _ = range;
-                        // for (range) |j| {
-                        //     std.debug.print("{?} ", .{j});
-                        // }
-                        // std.debug.print("\n", .{});
+                    .range => |r| {
+                        if (!(r[0] == null and r[1] == null and r[2] == null)) ok = false;
                     },
+                }
+                if (ok == false) break;
+            }
+            if (ok or new_idxs.len == 1) {
+                if (idx_pos == 0) { //this only means we slice the complete tensor
+                    // std.debug.print("{d} {d}\n", .{ self.data.len, to.data.len });
+                    std.debug.assert(self.data.len == to.data.len);
+                    @memcpy(to.data, self.data);
+                    return self.data.len;
+                } else {
+                    const old_len = data_idxs.items.len;
+                    for (0..to.shape.len - data_idxs.items.len) |i| {
+                        switch (new_idxs[i]) {
+                            .idx => |idx| try data_idxs.append(@intCast(idx)),
+                            .range => try data_idxs.append(0),
+                        }
+                    }
+
+                    const start = getIndex(self.shape, self.offsets, data_idxs.items);
+
+                    var length: usize = 1;
+                    for (to.shape[idx_pos..]) |d| length *= @intCast(d);
+
+                    std.debug.print("{d} {d} {d} {d} {?}\n", .{ to_offset, start, length, idx_pos, ok });
+                    const s = try tensorIdxToString(to.alloc, idxs, null);
+                    defer to.alloc.free(s);
+                    const di = try sliceToString(usize, to.alloc, data_idxs.items);
+                    defer to.alloc.free(di);
+                    std.debug.print("{s} - data idxs: {s}\n", .{ s, di });
+
+                    @memcpy(to.data[to_offset .. to_offset + length], self.data[start .. start + length]);
+                    try data_idxs.resize(old_len);
+                    return length;
                 }
             }
 
-            return TensorError.Dummy;
-        }
-
-        //computes the index in .data
-        inline fn getIndex(self: *const Self, idxs: []const usize) usize {
-            std.debug.assert(self.shape.len > 0);
-            std.debug.assert(self.offsets.len == idxs.len);
-            std.debug.assert(self.offsets[self.offsets.len - 1] == 0);
-            var sum: usize = idxs[idxs.len - 1];
-            for (0..self.offsets.len - 1) |i| {
-                sum += self.offsets[i] * idxs[i];
+            var total_copied: usize = 0;
+            try data_idxs.append(undefined);
+            switch (new_idxs[0]) {
+                .idx => |idx| {
+                    data_idxs.items[data_idxs.items.len - 1] = @intCast(idx);
+                    total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, total_copied);
+                },
+                .range => |range| {
+                    const start = range[0] orelse 0;
+                    const end = range[1] orelse self.shape[idx_pos];
+                    const step = range[2] orelse 1;
+                    var i: usize = @intCast(start);
+                    while (i < end) : (i += @intCast(step)) {
+                        data_idxs.items[data_idxs.items.len - 1] = @intCast(i);
+                        total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, total_copied);
+                    }
+                },
             }
-            return sum;
+            return total_copied;
         }
 
         // pub fn reshape(self: *const Self, shape: []i32) !Tensor {
@@ -201,6 +300,29 @@ pub fn fromSlice(comptime T: type, alloc: std.mem.Allocator, data: []const T, sh
     return tensor;
 }
 
+//TODO finish; requires float range to function properly --> needs rework of tensor range
+pub fn fromRange(comptime T: type, alloc: Allocator, range: TensorRange, shape: []const i32) !Tensor(T) {
+    var tensor = try Tensor(T).init(alloc, shape);
+    errdefer tensor.deinit();
+    if (getSizeFromShape(shape) != getTensorRangeLen(&range, tensor.data.len)) {
+        const shape_string = sliceToString(i32, shape, alloc);
+        defer alloc.free(shape_string);
+
+        //TODO print range
+        std.debug.print("Shape {s} does not fit to range", .{shape_string});
+        return TensorError.InvalidShape;
+    }
+    const start = range[0] orelse 0;
+    const end = range[1] orelse tensor.data.len;
+    const step = range[2] orelse 1;
+    var i = start;
+    var j: usize = 0;
+    while (i < end) : (i += step) {
+        defer j += 1;
+    }
+    return TensorError.Dummy();
+}
+
 fn dummyOp(comptime T: type, t: *const Tensor(T)) !void {
     _ = t;
     return TensorError.Dummy;
@@ -226,7 +348,7 @@ inline fn getSizeFromShape(shape: []const i32) i32 {
     return size;
 }
 //caller must free string
-inline fn tensorIdxToString(alloc: Allocator, idxs: []const TensorIdx, markAt: ?usize) ![]u8 {
+fn tensorIdxToString(alloc: Allocator, idxs: []const TensorIdx, markAt: ?usize) ![]u8 {
     const substrings = try alloc.alloc([]u8, idxs.len);
 
     var i: usize = 0;
@@ -265,11 +387,29 @@ inline fn tensorIdxToString(alloc: Allocator, idxs: []const TensorIdx, markAt: ?
     return std.fmt.allocPrint(alloc, "Tensor Index: [{s}]", .{idx_string});
 }
 
+fn sliceToString(comptime T: type, alloc: Allocator, data: []const T) ![]u8 {
+    var substrings = try std.ArrayList([]u8).initCapacity(alloc, data.len);
+    defer substrings.deinit();
+    if (@typeInfo(T) != .Int and @typeInfo(T) != .Float) {
+        return TensorError.WrongTypes;
+    }
+    for (data) |d| {
+        try substrings.append(try std.fmt.allocPrint(alloc, "{d}", .{d}));
+    }
+    defer {
+        for (substrings.items) |ss| {
+            alloc.free(ss);
+        }
+    }
+    const full_string = try std.mem.join(alloc, ", ", substrings.items);
+    return full_string;
+}
+
 fn tensorIdxIsValid(alloc: Allocator, shape: []const i32, idxs: []const TensorIdx) !bool {
     std.debug.assert(shape.len > 0);
     //check if the overall length fits
-    if (shape.len > idxs.len) {
-        std.debug.print("Expects idx.len <= dim.len, but idxs.len={d} and dim.len{d}\n", .{ shape.len, idxs.len });
+    if (shape.len < idxs.len) {
+        std.debug.print("Expects shape.len <= idx.len, but shape.len={d} and idx.len={d}\n", .{ shape.len, idxs.len });
         return false;
     }
     if (idxs.len == 0) {
@@ -279,14 +419,13 @@ fn tensorIdxIsValid(alloc: Allocator, shape: []const i32, idxs: []const TensorId
 
     //check if there are bounds violations
     for (0..idxs.len) |i| {
-        const d = idxs.len - 1 - i;
-        const field = idxs[d];
+        const field = idxs[i];
         switch (field) {
             .idx => |idx| {
                 // std.debug.print("{d}\n", .{idx});
                 //index in bounds
-                if (idx > shape[shape.len - 1 - i]) {
-                    const idx_str = try tensorIdxToString(alloc, idxs, d);
+                if (idx > shape[i]) {
+                    const idx_str = try tensorIdxToString(alloc, idxs, i);
                     defer alloc.free(idx_str);
                     std.debug.print("Invalid index in {s} for shape [", .{idx_str});
                     for (shape) |s| {
@@ -297,11 +436,11 @@ fn tensorIdxIsValid(alloc: Allocator, shape: []const i32, idxs: []const TensorId
                 }
             },
             .range => |range| {
-                const s = shape[shape.len - 1 - i];
+                const s = shape[i];
                 const start_wrong = range[0] != null and (range[0].? < 0 or range[0].? >= s);
                 const end_wrong = range[1] != null and (range[1].? < 0 or range[1].? >= s);
                 if (start_wrong or end_wrong) {
-                    const idx_str = try tensorIdxToString(alloc, idxs, d);
+                    const idx_str = try tensorIdxToString(alloc, idxs, i);
                     defer alloc.free(idx_str);
                     std.debug.print("Invalid range in {s} for shape [", .{idx_str});
                     for (shape) |sh| {
@@ -315,6 +454,19 @@ fn tensorIdxIsValid(alloc: Allocator, shape: []const i32, idxs: []const TensorId
     }
 
     return true;
+}
+
+//computes the index in .data
+fn getIndex(shape: []const i32, offsets: []const usize, idxs: []const usize) usize {
+    std.debug.assert(shape.len > 0);
+    std.debug.assert(offsets.len == shape.len);
+    std.debug.assert(offsets[offsets.len - 1] == 0);
+    std.debug.assert(idxs.len == offsets.len);
+    var sum: usize = idxs[idxs.len - 1];
+    for (0..offsets.len - 1) |i| {
+        sum += offsets[i] * idxs[i];
+    }
+    return sum;
 }
 
 //Tests -------------------------------------------------------------------------------------------------------------
@@ -431,9 +583,9 @@ test "get sub tensor wrong indices" {
     var tensor = try zeros(i64, alloc, &[_]i32{ 2, 3 });
     defer tensor.deinit();
 
-    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 4 }, .{ .range = .{ 1, null, null } } }));
-    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ 3, null, null } } }));
-    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ null, 3, null } } }));
+    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 4 }, .{ .range = .{ 1, null, null } } }, alloc));
+    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ 3, null, null } } }, alloc));
+    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ null, 3, null } } }, alloc));
 }
 
 test "getIndex" {
@@ -444,5 +596,39 @@ test "getIndex" {
 
     const idxs = [_]usize{ 1, 2, 1 };
     try testing.expectEqualSlices(usize, &[_]usize{ 6, 2, 0 }, tensor.offsets);
-    try testing.expectEqual(11, tensor.getIndex(&idxs));
+    try testing.expectEqual(11, getIndex(tensor.shape, tensor.offsets, &idxs));
+}
+
+test "get" {
+    //TODO This will be obsoloete very fast
+    const alloc = testing.allocator;
+
+    var tensor = try fromSlice(f32, alloc, &[_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 }, &[_]i32{ 4, 3, 2 });
+    defer tensor.deinit();
+    {
+        const a = try tensor.get(&[_]TensorIdx{.{ .idx = 0 }}, alloc);
+        defer a.deinit();
+
+        try testing.expectEqual(tensor.shape.len, a.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 1, 3, 2 }, a.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0, 1, 2, 3, 4, 5 }, a.data);
+    }
+
+    {
+        const b = try tensor.get(&[_]TensorIdx{ .{ .idx = 0 }, .{ .idx = 1 } }, alloc);
+        defer b.deinit();
+
+        try testing.expectEqual(tensor.shape.len, b.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 2 }, b.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 2, 3 }, b.data);
+    }
+
+    {
+        const c = try tensor.get(&[_]TensorIdx{ .{ .idx = 0 }, .{ .idx = 1 }, .{ .idx = 1 } }, alloc);
+        defer c.deinit();
+
+        try testing.expectEqual(tensor.shape.len, c.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1 }, c.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{3}, c.data);
+    }
 }

@@ -20,7 +20,12 @@ const TensorError = error{
 //{null, null, x} -> [::z]
 pub const TensorRange = [3]?i32;
 inline fn getTensorRangeLen(range: *const TensorRange, default_len: i32) i32 {
-    return @divFloor((range[1] orelse default_len) - (range[0] orelse 0), range[2] orelse 1);
+    const step: i32 = range[2] orelse 1;
+    if (std.math.divCeil(i32, (range[1] orelse default_len) - (range[0] orelse 0), step)) |res| {
+        return res;
+    } else |_| {
+        return 0;
+    }
 }
 pub const FullRange = TensorRange{ null, null, null };
 
@@ -159,24 +164,6 @@ fn Tensor(comptime T: type) type {
             const copied = try self.sliceRec(&new_tensor, exp_idxs, 0, &data_idxs, 0);
             std.debug.assert(copied > 0);
 
-            // for (0..idxs.len) |i| {
-            //     const d = idxs.len - 1 - i;
-            //     const field = idxs[d];
-            //     switch (field) {
-            //         .idx => |idx| {
-            //             // std.debug.print("{d}\n", .{idx});
-            //             _ = idx;
-            //         },
-            //         .range => |range| {
-            //             _ = range;
-            //             // for (range) |j| {
-            //             //     std.debug.print("{?} ", .{j});
-            //             // }
-            //             // std.debug.print("\n", .{});
-            //         },
-            //     }
-            // }
-
             //TODO deduce which dimensions to remove
 
             return new_tensor;
@@ -185,7 +172,16 @@ fn Tensor(comptime T: type) type {
         fn sliceRec(self: *const Self, to: *Self, idxs: []const TensorIdx, idx_pos: usize, data_idxs: *std.ArrayList(usize), to_offset: usize) !usize {
             //idx_pos describes the position sliced idxs: idxs[idx_pos:]
             //if(idxs describes successive memory)
+            {
+                const s = try tensorIdxToString(to.alloc, idxs, null);
+                defer to.alloc.free(s);
+                const di = try sliceToString(usize, to.alloc, data_idxs.items);
+                defer to.alloc.free(di);
+                std.debug.print("{s} - data idxs: {s}\n", .{ s, di });
+            }
+
             std.debug.assert(idxs.len == self.shape.len); //idxs must be expanded
+            std.debug.assert(data_idxs.items.len <= idxs.len);
             //TODO assert all elements are ranges of lists
             const new_idxs = idxs[idx_pos..];
             var ok = true;
@@ -201,12 +197,18 @@ fn Tensor(comptime T: type) type {
                 if (ok == false) break;
             }
             if (ok or new_idxs.len == 1) {
+                std.debug.print("Reached recursive break cond\n", .{});
+                defer std.debug.print("Recursive break cond end\n", .{});
                 if (idx_pos == 0) { //this only means we slice the complete tensor
                     // std.debug.print("{d} {d}\n", .{ self.data.len, to.data.len });
                     std.debug.assert(self.data.len == to.data.len);
                     @memcpy(to.data, self.data);
                     return self.data.len;
                 } else {
+                    const ss = try sliceToString(i32, to.alloc, to.shape);
+                    defer to.alloc.free(ss);
+                    std.debug.print("to shape {s} - di len {d}\n", .{ ss, data_idxs.items.len });
+
                     const old_len = data_idxs.items.len;
                     for (0..to.shape.len - data_idxs.items.len) |i| {
                         switch (new_idxs[i]) {
@@ -238,7 +240,7 @@ fn Tensor(comptime T: type) type {
             switch (new_idxs[0]) {
                 .idx => |idx| {
                     data_idxs.items[data_idxs.items.len - 1] = @intCast(idx);
-                    total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, total_copied);
+                    total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, to_offset + total_copied);
                 },
                 .range => |range| {
                     const start = range[0] orelse 0;
@@ -247,10 +249,11 @@ fn Tensor(comptime T: type) type {
                     var i: usize = @intCast(start);
                     while (i < end) : (i += @intCast(step)) {
                         data_idxs.items[data_idxs.items.len - 1] = @intCast(i);
-                        total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, total_copied);
+                        total_copied += try sliceRec(self, to, idxs, idx_pos + 1, data_idxs, to_offset + total_copied);
                     }
                 },
             }
+            try data_idxs.resize(data_idxs.items.len - 1);
             return total_copied;
         }
 
@@ -436,9 +439,13 @@ fn tensorIdxIsValid(alloc: Allocator, shape: []const i32, idxs: []const TensorId
                 }
             },
             .range => |range| {
+                //TODO Fix me range violation not correctly detected: Check if all indices are in shape !
                 const s = shape[i];
-                const start_wrong = range[0] != null and (range[0].? < 0 or range[0].? >= s);
-                const end_wrong = range[1] != null and (range[1].? < 0 or range[1].? >= s);
+                const start = range[0] orelse 0;
+                const end = range[1] orelse s;
+                const step = range[2] orelse 1;
+                const start_wrong = start < 0 or start >= s;
+                const end_wrong = end < 0 or (getTensorRangeLen(&range, s) - 1) * step + start >= s;
                 if (start_wrong or end_wrong) {
                     const idx_str = try tensorIdxToString(alloc, idxs, i);
                     defer alloc.free(idx_str);
@@ -585,7 +592,7 @@ test "get sub tensor wrong indices" {
 
     try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 4 }, .{ .range = .{ 1, null, null } } }, alloc));
     try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ 3, null, null } } }, alloc));
-    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ null, 3, null } } }, alloc));
+    try testing.expectError(TensorError.InvalidIndex, tensor.get(&[_]TensorIdx{ .{ .idx = 1 }, .{ .range = .{ null, 4, null } } }, alloc));
 }
 
 test "getIndex" {
@@ -630,5 +637,69 @@ test "get" {
         try testing.expectEqual(tensor.shape.len, c.shape.len);
         try testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1 }, c.shape);
         try testing.expectEqualSlices(f32, &[_]f32{3}, c.data);
+    }
+
+    {
+        const d = try tensor.get(&[_]TensorIdx{
+            .{ .range = FullRange },
+            .{ .idx = 1 },
+        }, alloc);
+        defer d.deinit();
+
+        try testing.expectEqual(tensor.shape.len, d.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 4, 1, 2 }, d.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 8, 9, 14, 15, 20, 21 }, d.data);
+    }
+
+    {
+        std.debug.print("----------------------------\n", .{});
+        const e = try tensor.get(&[_]TensorIdx{
+            .{ .range = FullRange },
+            .{ .range = TensorRange{ null, null, 2 } },
+        }, alloc);
+        defer e.deinit();
+
+        try testing.expectEqual(tensor.shape.len, e.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 4, 2, 2 }, e.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0, 1, 4, 5, 6, 7, 10, 11, 12, 13, 16, 17, 18, 19, 22, 23 }, e.data);
+    }
+
+    {
+        std.debug.print("----------------------------\n", .{});
+        const f = try tensor.get(&[_]TensorIdx{
+            .{ .range = FullRange },
+            .{ .range = TensorRange{ 1, null, 2 } },
+        }, alloc);
+        defer f.deinit();
+
+        try testing.expectEqual(tensor.shape.len, f.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 4, 1, 2 }, f.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 8, 9, 14, 15, 20, 21 }, f.data);
+    }
+    {
+        std.debug.print("----------------------------\n", .{});
+        const g = try tensor.get(&[_]TensorIdx{
+            .{ .range = TensorRange{ 0, 3, 1 } },
+            .{ .idx = 0 },
+            .{ .range = TensorRange{ 0, 2, 1 } },
+        }, alloc);
+        defer g.deinit();
+
+        try testing.expectEqual(tensor.shape.len, g.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 3, 1, 2 }, g.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0, 1, 6, 7, 12, 13 }, g.data);
+    }
+    {
+        std.debug.print("----------------------------\n", .{});
+        const h = try tensor.get(&[_]TensorIdx{
+            .{ .range = FullRange },
+            .{ .range = FullRange },
+            .{ .idx = 0 },
+        }, alloc);
+        defer h.deinit();
+
+        try testing.expectEqual(tensor.shape.len, h.shape.len);
+        try testing.expectEqualSlices(i32, &[_]i32{ 4, 3, 1 }, h.shape);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22 }, h.data);
     }
 }
